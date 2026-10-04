@@ -1,0 +1,1049 @@
+%% =========================================================================
+%  REGENERATIVE BRAKING SYSTEM WITH FOC, MTPA, FIELD WEAKENING, MPTV
+%  Complete MATLAB Model
+%  =========================================================================
+clear all; close all; clc;
+
+%% =========================================================================
+%  1. SYSTEM PARAMETERS (INPUTS)
+%  =========================================================================
+
+% ----- Vehicle Parameters -----
+m_vehicle = 2135;           % Vehicle mass [kg]
+r_wheel = 0.43;             % Wheel radius [m]
+gear_ratio = 11;          % Gear ratio //the second is 5:1
+C_drag = 0.21;               % Aerodynamic drag coefficient
+A_frontal = 2.2;            % Frontal area [m²]
+rho_air = 1.225;            % Air density [kg/m³] //standard according to ISA
+C_rr = 0.01;                % Rolling resistance coefficient= force to move a rolling object devided by it's load
+g = 9.81;                   % Gravitational acceleration [m/s²]
+
+% ----- PMSM Motor Parameters -----
+Rs = 0.02;                  % Stator resistance [Ω] originates from DC current resistane in copper windings 
+Ld = 0.0004;               % d-axis inductance [H]
+Lq = 0.0008;               % q-axis inductance [H] (Saliency: Lq > Ld)
+lambda_pm = 0.05;          % PM flux linkage [Wb]
+p = 3;                      % Number of pole pairs
+J_motor = 0.01;             % Motor inertia [kg.m²]
+J_vehicle = m_vehicle * r_wheel^2 / gear_ratio^2;  % Vehicle inertia referred to motor
+J_total = J_motor + J_vehicle;
+B_friction = 0.001;         % Friction coefficient [N.m.s/rad]
+
+% ----- Inverter Parameters -----
+V_dc_nom = 750;             % DC bus voltage [V]
+V_dc_max = 800;             % Maximum DC bus voltage [V]
+I_max = 300;                % Maximum phase current [A]
+f_pwm = 10000;              % PWM frequency [Hz]
+
+% ----- Battery Parameters -----
+V_batt_nom = 700;           % Nominal battery voltage [V]
+Q_batt = 130;                % Battery capacity [Ah]
+C_batt = Q_batt * 3600;     % Battery capacity [As]
+R_batt_int = 0.05;          % Internal resistance [Ω]
+SOC_init = 0.60;            % Initial SOC [60%]
+SOC_max = 0.95;             % Maximum SOC for regen [95%]
+I_charge_max = -100;        % Maximum charging current [A] (negative)
+
+% ----- Simulation Parameters -----
+dt = 0.0001;                % Time step [s]
+t_end = 10;                 % Simulation time [s]
+t = 0:dt:t_end;             % Time vector
+N = length(t);
+
+%% =========================================================================
+%  2. DRIVING CYCLE & BRAKING PROFILE DEFINITION
+%  =========================================================================
+
+% Initial vehicle speed
+v_vehicle_0 = 100/3.6;      % 100 km/h to m/s
+
+% Create braking profile (braking intensity 0 to 1)
+brake_profile = zeros(1, N);
+for i = 1:N
+    if t(i) >= 1 && t(i) < 2
+        brake_profile(i) = 0.3 * (t(i) - 1);      % Gradual brake
+    elseif t(i) >= 2 && t(i) < 5
+        brake_profile(i) = 0.3;                     % Mild braking
+    elseif t(i) >= 5 && t(i) < 6
+        brake_profile(i) = 0.3 + 0.5*(t(i)-5);    % Increase braking
+    elseif t(i) >= 6 && t(i) < 8
+        brake_profile(i) = 0.8;                     % Strong braking
+    elseif t(i) >= 8 && t(i) < 9
+        brake_profile(i) = 0.8 - 0.5*(t(i)-8);    % Release brake
+    elseif t(i) >= 9 && t(i) < 10
+        brake_profile(i) = 0.3;                     % Light braking
+    else
+        brake_profile(i) = 0;                       % No braking
+    end
+end
+
+%% =========================================================================
+%  3. OPERATING POINT CALCULATIONS
+%  =========================================================================
+
+% Base speed calculation
+omega_base = V_dc_nom / (sqrt(3) * p * sqrt(lambda_pm^2 + (Lq*I_max)^2));
+n_base = omega_base * 60 / (2*pi);
+
+% Characteristic current
+Id_char = -lambda_pm / Lq;
+
+% Maximum torque at base speed (MTPA)
+[T_max_mtpa, Id_mtpa_max, Iq_mtpa_max] = calculate_mtpa_torque(I_max, Ld, Lq, lambda_pm);
+
+% Short circuit torque
+T_sc = 1.5 * p * lambda_pm * Id_char;
+
+fprintf('========== MOTOR OPERATING POINTS ==========\n');
+fprintf('Base speed: %.2f rad/s (%.1f RPM)\n', omega_base, n_base);
+fprintf('Characteristic current Id_char: %.2f A\n', Id_char);
+fprintf('Max MTPA torque: %.2f Nm\n', T_max_mtpa);
+fprintf('Short circuit torque: %.2f Nm\n', T_sc);
+fprintf('============================================\n\n');
+
+%% =========================================================================
+%  4. INITIALIZATION OF STATE VARIABLES
+%  =========================================================================
+
+% Vehicle states
+omega_mech = v_vehicle_0 * gear_ratio / r_wheel;  % Mechanical speed [rad/s]
+v_vehicle = v_vehicle_0;                           % Vehicle speed [m/s]
+
+% Motor electrical states
+Id = 0;                    % d-axis current [A]
+Iq = 0;                    % q-axis current [A]
+theta_e = 0;               % Electrical angle [rad]
+
+% Battery states
+SOC = SOC_init;
+V_batt = V_batt_nom;
+I_batt = 0;
+
+% Control states
+Vd = 0;                    % d-axis voltage [V]
+Vq = 0;                    % q-axis voltage [V]
+T_motor = 0;               % Motor torque [Nm]
+T_ref = 0;                 % Reference torque [Nm]
+
+% PI Controller states (integrated errors)
+int_err_Id = 0;
+int_err_Iq = 0;
+
+% Data logging arrays
+log.omega_mech = zeros(1, N);
+log.Id = zeros(1, N);
+log.Iq = zeros(1, N);
+log.Vd = zeros(1, N);
+log.Vq = zeros(1, N);
+log.T_motor = zeros(1, N);
+log.T_ref = zeros(1, N);
+log.SOC = zeros(1, N);
+log.I_batt = zeros(1, N);
+log.V_batt = zeros(1, N);
+log.v_vehicle = zeros(1, N);
+log.P_motor = zeros(1, N);
+log.P_batt = zeros(1, N);
+log.P_loss = zeros(1, N);
+log.Vs = zeros(1, N);
+log.Is = zeros(1, N);
+log.mode = zeros(1, N);       % 1=MTPA, 2=FW, 3=MPTV
+log.energy_recovered = zeros(1, N);
+log.omega_e = zeros(1, N);
+
+%% =========================================================================
+%  5. PI CONTROLLER GAINS TUNING
+%  =========================================================================
+
+% Current controller bandwidth
+wc = 2000;  % [rad/s]
+
+% d-axis PI gains
+Kp_d = wc * Ld;
+Ki_d = wc * Rs;
+
+% q-axis PI gains
+Kp_q = wc * Lq;
+Ki_q = wc * Rs;
+
+fprintf('========== PI CONTROLLER GAINS ==========\n');
+fprintf('d-axis: Kp=%.4f, Ki=%.2f\n', Kp_d, Ki_d);
+fprintf('q-axis: Kp=%.4f, Ki=%.2f\n', Kp_q, Ki_q);
+fprintf('==========================================\n\n');
+
+%% =========================================================================
+%  6. MAIN SIMULATION LOOP
+%  =========================================================================
+
+fprintf('Starting simulation...\n');
+total_energy_recovered = 0;
+
+for i = 1:N
+    
+    % ----- Store initial states -----
+    log.omega_mech(i) = omega_mech;
+    log.v_vehicle(i) = v_vehicle;
+    
+    % Electrical speed and angle
+    omega_e = p * omega_mech;
+    log.omega_e(i) = omega_e;
+    
+    % ----- 6.1 BRAKING TORQUE CALCULATION -----
+    
+    % Maximum braking torque from vehicle dynamics
+    F_aero = 0.5 * rho_air * C_drag * A_frontal * v_vehicle^2;
+    F_rr = m_vehicle * g * C_rr;
+    T_max_brake = (F_aero + F_rr) * r_wheel / gear_ratio;
+    
+    % Requested braking torque (negative for braking)
+    T_brake_request = -brake_profile(i) * 200;  % Scale factor
+    
+    % ----- 6.2 REGENERATIVE BRAKING AVAILABILITY CHECK -----
+    
+    regen_available = true;
+    
+    % Check SOC limit
+    if SOC >= SOC_max
+        regen_available = false;
+    end
+    
+    % Check minimum speed (below 5 km/h, no regen)
+    if v_vehicle < 5/3.6
+        regen_available = false;
+    end
+    
+    % ----- 6.3 REFERENCE TORQUE LIMITATION -----
+    
+    if regen_available
+        T_ref = T_brake_request;
+        
+        % Limit based on maximum current
+        T_max_neg = -T_max_mtpa;
+        T_ref = max(T_ref, T_max_neg);
+        
+        % Limit based on battery charging current
+        % Approximate: P_batt = T * omega_mech * efficiency
+        eta_est = 0.9;
+        P_est = T_ref * omega_mech * eta_est;
+        I_batt_est = P_est / V_batt;
+        if I_batt_est < I_charge_max
+            T_ref = I_charge_max * V_batt / (omega_mech * eta_est);
+        end
+    else
+        T_ref = 0;  % No regenerative braking
+    end
+    
+    log.T_ref(i) = T_ref;
+    
+    % ----- 6.4 MTPA / FIELD WEAKENING / MPTV SELECTION -----
+    
+    % Calculate voltage limit
+    Vs_max = V_batt / sqrt(3);
+    
+    % Current magnitude from torque request
+    Is_mag = sqrt(Id^2 + Iq^2);
+    
+    % Determine operating mode
+    if omega_mech <= omega_base
+        % ============================================
+        % MODE 1: MTPA OPERATION (Below base speed)
+        % ============================================
+        mode = 1;
+        
+        % MTPA current references
+        [Id_ref_mtpa, Iq_ref_mtpa] = calculate_mtpa_currents(T_ref, Ld, Lq, lambda_pm);
+        
+        % Apply current limits
+        Is_ref = sqrt(Id_ref_mtpa^2 + Iq_ref_mtpa^2);
+        if Is_ref > I_max
+            Id_ref_mtpa = Id_ref_mtpa * I_max / Is_ref;
+            Iq_ref_mtpa = Iq_ref_mtpa * I_max / Is_ref;
+        end
+        
+        Id_ref = Id_ref_mtpa;
+        Iq_ref = Iq_ref_mtpa;
+        
+    else
+        % ============================================
+        % MODE 2 & 3: FIELD WEAKENING (Above base speed)
+        % ============================================
+        
+        % First, get MTPA operating point for this torque
+        [Id_mtpa, Iq_mtpa] = calculate_mtpa_currents(T_ref, Ld, Lq, lambda_pm);
+        
+        % Calculate voltage at MTPA point
+        [Vd_mtpa, Vq_mtpa] = calculate_voltages(Id_mtpa, Iq_mtpa, omega_e, Rs, Ld, Lq, lambda_pm);
+        Vs_mtpa = sqrt(Vd_mtpa^2 + Vq_mtpa^2);
+        
+        if Vs_mtpa <= Vs_max
+            % MTPA is feasible (rare above base speed)
+            mode = 1;
+            Id_ref = Id_mtpa;
+            Iq_ref = Iq_mtpa;
+        else
+            % Need field weakening
+            % Check if we're at MPTV region
+            T_at_char = 1.5 * p * (lambda_pm * Id_char + (Ld - Lq) * Id_char^2);
+            
+            if abs(T_ref) < abs(T_at_char) && omega_mech > 1.5 * omega_base
+                % ============================================
+                % MODE 3: MPTV (Maximum Torque Per Voltage)
+                % ============================================
+                mode = 3;
+                [Id_ref, Iq_ref] = calculate_mptv_currents(T_ref, Vs_max, omega_e, ...
+                    Rs, Ld, Lq, lambda_pm);
+            else
+                % ============================================
+                % MODE 2: FIELD WEAKENING with Current Limit
+                % ============================================
+                mode = 2;
+                [Id_ref, Iq_ref] = calculate_fw_currents(T_ref, Vs_max, omega_e, ...
+                    Rs, Ld, Lq, lambda_pm, I_max);
+            end
+        end
+    end
+    
+    log.mode(i) = mode;
+    
+    % ----- 6.5 FOC CURRENT CONTROL (PI Controllers) -----
+    
+    % Anti-windup limits
+    Vd_max = Vs_max;
+    Vq_max = Vs_max;
+    
+    % d-axis current error and PI
+    err_Id = Id_ref - Id;
+    int_err_Id = int_err_Id + err_Id * dt;
+    
+    % Anti-windup
+    Vd_cmd = Kp_d * err_Id + Ki_d * int_err_Id;
+    if abs(Vd_cmd) > Vd_max
+        int_err_Id = int_err_Id - err_Id * dt;  % Revert integration
+        Vd_cmd = sign(Vd_cmd) * Vd_max;
+    end
+    
+    % q-axis current error and PI
+    err_Iq = Iq_ref - Iq;
+    int_err_Iq = int_err_Iq + err_Iq * dt;
+    
+    % Anti-windup
+    Vq_cmd = Kp_q * err_Iq + Ki_q * int_err_Iq;
+    if abs(Vq_cmd) > Vq_max
+        int_err_Iq = int_err_Iq - err_Iq * dt;  % Revert integration
+        Vq_cmd = sign(Vq_cmd) * Vq_max;
+    end
+    
+    % Voltage limiting (circle constraint)
+    Vs_cmd = sqrt(Vd_cmd^2 + Vq_cmd^2);
+    if Vs_cmd > Vs_max
+        Vd_cmd = Vd_cmd * Vs_max / Vs_cmd;
+        Vq_cmd = Vq_cmd * Vs_max / Vs_cmd;
+    end
+    
+    Vd = Vd_cmd;
+    Vq = Vq_cmd;
+    
+    log.Vd(i) = Vd;
+    log.Vq(i) = Vq;
+    log.Vs(i) = sqrt(Vd^2 + Vq^2);
+    
+    % ----- 6.6 MOTOR ELECTRICAL DYNAMICS -----
+    
+    % d-axis: Ld * dId/dt = Vd - Rs*Id + omega_e*Lq*Iq
+    dId_dt = (Vd - Rs*Id + omega_e*Lq*Iq) / Ld;
+    Id = Id + dId_dt * dt;
+    
+    % q-axis: Lq * dIq/dt = Vq - Rs*Iq - omega_e*Ld*Id - omega_e*lambda_pm
+    dIq_dt = (Vq - Rs*Iq - omega_e*Ld*Id - omega_e*lambda_pm) / Lq;
+    Iq = Iq + dIq_dt * dt;
+    
+    log.Id(i) = Id;
+    log.Iq(i) = Iq;
+    log.Is(i) = sqrt(Id^2 + Iq^2);
+    
+    % ----- 6.7 ELECTROMAGNETIC TORQUE -----
+    
+    T_motor = 1.5 * p * (lambda_pm * Iq + (Ld - Lq) * Id * Iq);
+    log.T_motor(i) = T_motor;
+    
+    % ----- 6.8 MECHANICAL DYNAMICS -----
+    
+    % dω/dt = (T_motor - T_load - B*ω) / J
+    % During regen: T_motor is negative (braking), T_load is positive (resistance)
+    T_resist = T_max_brake;  % Vehicle resistance torque
+    domega_dt = (T_motor - T_resist - B_friction * omega_mech) / J_total;
+    omega_mech = omega_mech + domega_dt * dt;
+    
+    % Prevent negative speed
+    if omega_mech < 0
+        omega_mech = 0;
+    end
+    
+    % Update vehicle speed
+    v_vehicle = omega_mech * r_wheel / gear_ratio;
+    
+    % ----- 6.9 ELECTRICAL ANGLE UPDATE -----
+    
+    theta_e = theta_e + omega_e * dt;
+    theta_e = mod(theta_e, 2*pi);
+    
+    % ----- 6.10 POWER AND BATTERY CALCULATIONS -----
+    
+    % Motor electrical power (negative during regen)
+    P_motor = 1.5 * (Vd*Id + Vq*Iq);
+    log.P_motor(i) = P_motor;
+    
+    % Inverter losses (simplified)
+    P_switch = 0.02 * abs(P_motor);  % 2% switching losses
+    P_cond = 1.5 * Rs * (Id^2 + Iq^2);  % Conduction losses
+    P_loss = P_switch + P_cond;
+    log.P_loss(i) = P_loss;
+    
+    % Battery power (what actually charges the battery)
+    P_batt = P_motor - P_loss;
+    log.P_batt(i) = P_batt;
+    
+    % Battery current (negative = charging)
+    I_batt = P_batt / V_batt;
+    
+    % Limit charging current
+    if I_batt < I_charge_max
+        I_batt = I_charge_max;
+        P_batt = I_batt * V_batt;
+    end
+    
+    log.I_batt(i) = I_batt;
+    
+    % Battery voltage with internal resistance drop
+    V_batt = V_batt_nom - I_batt * R_batt_int;
+    log.V_batt(i) = V_batt;
+    
+    % ----- 6.11 SOC UPDATE -----
+    
+    % SOC change: dSOC/dt = -I_batt / C_batt (negative I_batt = charging = SOC increases)
+    dSOC = -I_batt * dt / C_batt;
+    SOC = SOC + dSOC;
+    
+    % SOC limits
+    if SOC > SOC_max
+        SOC = SOC_max;
+    elseif SOC < 0
+        SOC = 0;
+    end
+    
+    log.SOC(i) = SOC;
+    
+    % ----- 6.12 ENERGY RECOVERY TRACKING -----
+    
+    if P_batt < 0
+        total_energy_recovered = total_energy_recovered + abs(P_batt) * dt;
+    end
+    log.energy_recovered(i) = total_energy_recovered;
+    
+end
+
+fprintf('Simulation completed!\n');
+fprintf('Total energy recovered: %.4f Wh\n', total_energy_recovered/3600);
+fprintf('Final SOC: %.4f %%\n', SOC*100);
+fprintf('SOC increase: %.4f %%\n', (SOC - SOC_init)*100);
+
+%% =========================================================================
+%  7. VISUALIZATION - COMPREHENSIVE GRAPHS
+%  =========================================================================
+
+% Convert time to seconds for plotting
+t_plot = t;
+
+% Define mode colors
+mode_colors = [0 0.4 0.8;   % Blue for MTPA
+               0.8 0.4 0;   % Orange for FW
+               0.8 0 0];    % Red for MPTV
+
+%% ----- FIGURE 1: MAIN OVERVIEW -----
+figure('Name', 'Regenerative Braking - Main Overview', 'Position', [100 100 1400 900]);
+
+% Subplot 1: Vehicle Speed
+subplot(3,3,1);
+plot(t_plot, log.v_vehicle * 3.6, 'b-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('Speed [km/h]');
+title('Vehicle Speed');
+grid on; ylim([0 110]);
+
+% Subplot 2: Motor Speed
+subplot(3,3,2);
+plot(t_plot, log.omega_mech * 60/(2*pi), 'b-', 'LineWidth', 2);
+hold on;
+yline(n_base, 'r--', 'Base Speed', 'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('Speed [RPM]');
+title('Motor Speed');
+grid on;
+
+% Subplot 3: Torque
+subplot(3,3,3);
+plot(t_plot, log.T_ref, 'r--', 'LineWidth', 1.5); hold on;
+plot(t_plot, log.T_motor, 'b-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('Torque [Nm]');
+title('Motor Torque');
+legend('Reference', 'Actual', 'Location', 'best');
+grid on;
+
+% Subplot 4: d-axis Current
+subplot(3,3,4);
+plot(t_plot, log.Id, 'r-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('I_d [A]');
+title('d-axis Current (Field Weakening)');
+grid on;
+
+% Subplot 5: q-axis Current
+subplot(3,3,5);
+plot(t_plot, log.Iq, 'b-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('I_q [A]');
+title('q-axis Current (Torque Producing)');
+grid on;
+
+% Subplot 6: Stator Current Magnitude
+subplot(3,3,6);
+plot(t_plot, log.Is, 'm-', 'LineWidth', 2);
+hold on;
+yline(I_max, 'r--', 'I_{max}', 'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('|I_s| [A]');
+title('Stator Current Magnitude');
+grid on;
+
+% Subplot 7: d-axis Voltage
+subplot(3,3,7);
+plot(t_plot, log.Vd, 'r-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('V_d [V]');
+title('d-axis Voltage');
+grid on;
+
+% Subplot 8: q-axis Voltage
+subplot(3,3,8);
+plot(t_plot, log.Vq, 'b-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('V_q [V]');
+title('q-axis Voltage');
+grid on;
+
+% Subplot 9: Stator Voltage Magnitude
+subplot(3,3,9);
+plot(t_plot, log.Vs, 'g-', 'LineWidth', 2);
+hold on;
+yline(V_dc_nom/sqrt(3), 'r--', 'V_{s,max}', 'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('|V_s| [V]');
+title('Stator Voltage Magnitude');
+grid on;
+
+sgtitle('Regenerative Braking System - FOC with MTPA/Field Weakening/MPTV');
+
+%% ----- FIGURE 2: BATTERY & ENERGY -----
+figure('Name', 'Battery & Energy Recovery', 'Position', [150 150 1200 800]);
+
+% Subplot 1: Battery SOC
+subplot(2,2,1);
+plot(t_plot, log.SOC * 100, 'g-', 'LineWidth', 2.5);
+xlabel('Time [s]'); ylabel('SOC [%]');
+title(['Battery SOC (Initial: ' num2str(SOC_init*100) '%)']);
+grid on;
+ylim([SOC_init*100 - 1, SOC_max*100 + 1]);
+% Add annotation for SOC increase
+idx_start = find(brake_profile > 0, 1);
+idx_end = find(brake_profile > 0, 1, 'last');
+if ~isempty(idx_start) && ~isempty(idx_end)
+    soc_increase = (log.SOC(idx_end) - log.SOC(idx_start)) * 100;
+    text(t_plot(idx_end)+0.2, log.SOC(idx_end)*100, ...
+        sprintf('+%.3f%%', soc_increase), 'FontSize', 12, 'Color', 'r', 'FontWeight', 'bold');
+end
+
+% Subplot 2: Battery Current
+subplot(2,2,2);
+plot(t_plot, log.I_batt, 'b-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('I_{batt} [A]');
+title('Battery Current (Negative = Charging)');
+grid on;
+yline(I_charge_max, 'r--', 'I_{charge,max}', 'LineWidth', 1.5);
+% Fill charging regions
+fill_area = min(log.I_batt, 0);
+hold on;
+area(t_plot, fill_area, 'FaceColor', [0.2 0.8 0.2], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+
+% Subplot 3: Power
+subplot(2,2,3);
+plot(t_plot, log.P_motor, 'b-', 'LineWidth', 1.5); hold on;
+plot(t_plot, log.P_batt, 'g-', 'LineWidth', 2);
+plot(t_plot, log.P_loss, 'r-', 'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('Power [W]');
+title('Power Distribution');
+legend('P_{motor}', 'P_{battery}', 'P_{loss}', 'Location', 'best');
+grid on;
+% Fill battery charging power
+fill_power = min(log.P_batt, 0);
+hold on;
+area(t_plot, fill_power, 'FaceColor', [0.2 0.8 0.2], 'FaceAlpha', 0.2, 'EdgeColor', 'none');
+
+% Subplot 4: Cumulative Energy Recovered
+subplot(2,2,4);
+plot(t_plot, log.energy_recovered / 3600, 'm-', 'LineWidth', 2.5);
+xlabel('Time [s]'); ylabel('Energy [Wh]');
+title(['Total Energy Recovered: ' num2str(total_energy_recovered/3600, '%.3f') ' Wh']);
+grid on;
+% Add final value annotation
+text(t_plot(end)-1.5, total_energy_recovered/3600*0.9, ...
+    sprintf('%.3f Wh', total_energy_recovered/3600), ...
+    'FontSize', 12, 'Color', 'm', 'FontWeight', 'bold', 'HorizontalAlignment', 'right');
+
+sgtitle('Battery State of Charge & Energy Recovery');
+
+%% ----- FIGURE 3: CURRENT VECTOR TRAJECTORY (Id-Iq Plane) -----
+figure('Name', 'Current Vector Trajectory', 'Position', [200 200 1000 800]);
+
+subplot(1,2,1);
+% Color-code by operating mode
+for i = 2:N
+    if log.mode(i) == 1
+        color = mode_colors(1,:);
+    elseif log.mode(i) == 2
+        color = mode_colors(2,:);
+    else
+        color = mode_colors(3,:);
+    end
+    plot(log.Id(i), log.Iq(i), '.', 'Color', color, 'MarkerSize', 3);
+    hold on;
+end
+
+% Plot current limit circle
+theta_circle = linspace(0, 2*pi, 100);
+plot(I_max*cos(theta_circle), I_max*sin(theta_circle), 'k--', 'LineWidth', 1.5);
+% Plot MTPA trajectory
+Id_mtpa_traj = -50:0.5:0;
+Iq_mtpa_traj = zeros(size(Id_mtpa_traj));
+for j = 1:length(Id_mtpa_traj)
+    [~, Iq_mtpa_traj(j)] = calculate_mtpa_currents(1, Ld, Lq, lambda_pm);
+end
+% Actual MTPA curve
+Id_mtpa_range = linspace(0, -I_max*0.7, 100);
+Iq_mtpa_range = zeros(size(Id_mtpa_range));
+for j = 1:length(Id_mtpa_range)
+    [~, Iq_mtpa_range(j)] = calculate_mtpa_currents_from_Id(Id_mtpa_range(j), Ld, Lq, lambda_pm);
+end
+plot(Id_mtpa_range, -Iq_mtpa_range, 'b-', 'LineWidth', 2, 'DisplayName', 'MTPA');
+% Plot characteristic current line
+xline(Id_char, 'g--', 'I_d_{char}', 'LineWidth', 1.5);
+yline(0, 'k-', 'LineWidth', 0.5);
+
+xlabel('I_d [A]'); ylabel('I_q [A]');
+title('Current Vector Trajectory (Id-Iq Plane)');
+legend('MTPA', 'Current Limit', 'MPTV', 'Location', 'best');
+grid on;
+axis equal;
+
+subplot(1,2,2);
+% Zoomed view focusing on operating region
+for i = 2:N
+    if log.mode(i) == 1
+        color = mode_colors(1,:);
+    elseif log.mode(i) == 2
+        color = mode_colors(2,:);
+    else
+        color = mode_colors(3,:);
+    end
+    plot(log.Id(i), log.Iq(i), '.', 'Color', color, 'MarkerSize', 5);
+    hold on;
+end
+plot(Id_mtpa_range, -Iq_mtpa_range, 'b-', 'LineWidth', 2);
+xline(Id_char, 'g--', 'I_d_{char}', 'LineWidth', 1.5);
+xlabel('I_d [A]'); ylabel('I_q [A]');
+title('Zoomed Current Trajectory');
+grid on;
+axis equal;
+xlim([min(log.Id)*1.1, max(log.Id)*1.1 + 1]);
+ylim([min(log.Iq)*1.1, max(log.Iq)*1.1 + 1]);
+
+% Create legend manually
+h1 = plot(NaN, NaN, 'o', 'Color', mode_colors(1,:), 'MarkerSize', 8);
+h2 = plot(NaN, NaN, 'o', 'Color', mode_colors(2,:), 'MarkerSize', 8);
+h3 = plot(NaN, NaN, 'o', 'Color', mode_colors(3,:), 'MarkerSize', 8);
+legend([h1, h2, h3], {'MTPA', 'Field Weakening', 'MPTV'}, 'Location', 'best');
+
+%% ----- FIGURE 4: OPERATING MODE MAP -----
+figure('Name', 'Operating Mode Map', 'Position', [250 250 1200 500]);
+
+subplot(1,2,1);
+% Torque-Speed characteristic
+[Torque_grid, Speed_grid] = meshgrid(linspace(-T_max_mtpa, 0, 50), linspace(0, omega_mech(1)*1.1, 50));
+Mode_grid = zeros(size(Torque_grid));
+for ii = 1:size(Torque_grid, 1)
+    for jj = 1:size(Torque_grid, 2)
+        omega_tmp = Speed_grid(ii, jj);
+        T_tmp = Torque_grid(ii, jj);
+        Vs_max_tmp = V_dc_nom / sqrt(3);
+        if omega_tmp <= omega_base
+            Mode_grid(ii, jj) = 1;
+        else
+            [Id_mtpa_tmp, Iq_mtpa_tmp] = calculate_mtpa_currents(T_tmp, Ld, Lq, lambda_pm);
+            omega_e_tmp = p * omega_tmp;
+            [Vd_tmp, Vq_tmp] = calculate_voltages(Id_mtpa_tmp, Iq_mtpa_tmp, omega_e_tmp, Rs, Ld, Lq, lambda_pm);
+            Vs_tmp = sqrt(Vd_tmp^2 + Vq_tmp^2);
+            if Vs_tmp <= Vs_max_tmp
+                Mode_grid(ii, jj) = 1;
+            else
+                T_at_char = 1.5 * p * (lambda_pm * Id_char + (Ld - Lq) * Id_char^2);
+                if abs(T_tmp) < abs(T_at_char) && omega_tmp > 1.5 * omega_base
+                    Mode_grid(ii, jj) = 3;
+                else
+                    Mode_grid(ii, jj) = 2;
+                end
+            end
+        end
+    end
+end
+contourf(Speed_grid*60/(2*pi), Torque_grid, Mode_grid, [0.5 1.5 2.5 3.5], 'LineColor', 'none');
+colormap([0.2 0.5 0.9; 1 0.6 0.2; 0.9 0.2 0.2]);
+hold on;
+plot(log.omega_mech*60/(2*pi), log.T_motor, 'k-', 'LineWidth', 2);
+xline(n_base, 'w--', 'LineWidth', 2);
+xlabel('Speed [RPM]'); ylabel('Torque [Nm]');
+title('Operating Mode Map with Trajectory');
+colorbar('Ticks', [1 2 3], 'TickLabels', {'MTPA', 'Field Weakening', 'MPTV'});
+
+subplot(1,2,2);
+% Mode vs Time
+stairs(t_plot, log.mode, 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('Operating Mode');
+title('Operating Mode vs Time');
+yticks([1 2 3]);
+yticklabels({'MTPA', 'Field Weakening', 'MPTV'});
+ylim([0.5 3.5]);
+grid on;
+
+%% ----- FIGURE 5: VOLTAGE VECTOR TRAJECTORY -----
+figure('Name', 'Voltage Vector Trajectory', 'Position', [300 300 800 600]);
+
+plot(log.Vd, log.Vq, 'b-', 'LineWidth', 1.5);
+hold on;
+theta_circle = linspace(0, 2*pi, 100);
+plot((V_dc_nom/sqrt(3))*cos(theta_circle), (V_dc_nom/sqrt(3))*sin(theta_circle), 'r--', 'LineWidth', 2);
+% Mark starting point
+plot(log.Vd(1), log.Vq(1), 'go', 'MarkerSize', 10, 'LineWidth', 2);
+% Mark ending point
+plot(log.Vd(end), log.Vq(end), 'rs', 'MarkerSize', 10, 'LineWidth', 2);
+xlabel('V_d [V]'); ylabel('V_q [V]');
+title('Voltage Vector Trajectory (Vd-Vq Plane)');
+legend('Trajectory', 'Voltage Limit', 'Start', 'End', 'Location', 'best');
+grid on;
+axis equal;
+
+%% ----- FIGURE 6: EFFICIENCY AND LOSSES -----
+figure('Name', 'Efficiency Analysis', 'Position', [350 350 1000 600]);
+
+subplot(1,2,1);
+% Instantaneous efficiency
+eta = zeros(1, N);
+for i = 1:N
+    if log.P_motor(i) < 0 && abs(log.P_motor(i)) > 1
+        eta(i) = abs(log.P_batt(i) / log.P_motor(i)) * 100;
+    end
+end
+plot(t_plot, eta, 'g-', 'LineWidth', 2);
+xlabel('Time [s]'); ylabel('Efficiency [%]');
+title('Regenerative Braking Efficiency');
+grid on;
+ylim([0 100]);
+
+subplot(1,2,2);
+% Loss breakdown
+P_copper = 1.5 * Rs * (log.Id.^2 + log.Iq.^2);
+P_total_loss = log.P_loss;
+plot(t_plot, P_copper/1000, 'r-', 'LineWidth', 2); hold on;
+plot(t_plot, (P_total_loss - P_copper)/1000, 'b-', 'LineWidth', 2);
+plot(t_plot, P_total_loss/1000, 'k--', 'LineWidth', 1.5);
+xlabel('Time [s]'); ylabel('Power [kW]');
+title('Loss Breakdown');
+legend('Copper Losses', 'Switching Losses', 'Total Losses', 'Location', 'best');
+grid on;
+
+%% ----- FIGURE 7: DETAILED CURRENT WAVEFORMS -----
+figure('Name', 'Detailed Current Waveforms', 'Position', [400 100 1400 600]);
+
+% Select a zoom window
+t_zoom_start = 2;
+t_zoom_end = 2.01;
+idx_zoom = find(t >= t_zoom_start & t <= t_zoom_end);
+
+subplot(1,3,1);
+plot(t(idx_zoom)*1000, log.Id(idx_zoom), 'r-', 'LineWidth', 2);
+xlabel('Time [ms]'); ylabel('I_d [A]');
+title('d-axis Current (Zoomed)');
+grid on;
+
+subplot(1,3,2);
+plot(t(idx_zoom)*1000, log.Iq(idx_zoom), 'b-', 'LineWidth', 2);
+xlabel('Time [ms]'); ylabel('I_q [A]');
+title('q-axis Current (Zoomed)');
+grid on;
+
+subplot(1,3,3);
+% Phase currents (transform from dq to abc)
+Ia = zeros(size(idx_zoom));
+Ib = zeros(size(idx_zoom));
+Ic = zeros(size(idx_zoom));
+for k = 1:length(idx_zoom)
+    idx = idx_zoom(k);
+    theta_k = log.omega_e(idx) * t(idx);  % Approximate angle
+    Ia(k) = log.Id(idx)*cos(theta_k) - log.Iq(idx)*sin(theta_k);
+    Ib(k) = log.Id(idx)*cos(theta_k - 2*pi/3) - log.Iq(idx)*sin(theta_k - 2*pi/3);
+    Ic(k) = log.Id(idx)*cos(theta_k + 2*pi/3) - log.Iq(idx)*sin(theta_k + 2*pi/3);
+end
+plot(t(idx_zoom)*1000, Ia, 'r-', 'LineWidth', 2); hold on;
+plot(t(idx_zoom)*1000, Ib, 'g-', 'LineWidth', 2);
+plot(t(idx_zoom)*1000, Ic, 'b-', 'LineWidth', 2);
+xlabel('Time [ms]'); ylabel('Current [A]');
+title('Phase Currents (abc)');
+legend('I_a', 'I_b', 'I_c', 'Location', 'best');
+grid on;
+
+%% ----- FIGURE 8: SUMMARY DASHBOARD -----
+figure('Name', 'Summary Dashboard', 'Position', [450 200 1000 700]);
+
+% Create text summary
+summary_text = {
+    '═══════════════════════════════════════════════════'
+    '    REGENERATIVE BRAKING SYSTEM - SUMMARY REPORT'
+    '═══════════════════════════════════════════════════'
+    ''
+    ['  INITIAL CONDITIONS:']
+    ['    • Vehicle Speed:      ' num2str(v_vehicle_0*3.6, '%.1f') ' km/h']
+    ['    • Initial SOC:        ' num2str(SOC_init*100, '%.2f') ' %']
+    ['    • DC Bus Voltage:     ' num2str(V_dc_nom, '%.0f') ' V']
+    ''
+    ['  MOTOR PARAMETERS:']
+    ['    • Pole Pairs:         ' num2str(p)]
+    ['    • Rs:                 ' num2str(Rs*1000, '%.1f') ' mΩ']
+    ['    • Ld:                 ' num2str(Ld*1000, '%.2f') ' mH']
+    ['    • Lq:                 ' num2str(Lq*1000, '%.2f') ' mH']
+    ['    • λ_pm:               ' num2str(lambda_pm*1000, '%.1f') ' mWb']
+    ['    • Base Speed:         ' num2str(n_base, '%.0f') ' RPM']
+    ''
+    ['  RESULTS:']
+    ['    • Final Speed:        ' num2str(v_vehicle*3.6, '%.1f') ' km/h']
+    ['    • Final SOC:          ' num2str(SOC*100, '%.4f') ' %']
+    ['    • SOC Increase:       ' num2str((SOC-SOC_init)*100, '%.4f') ' %']
+    ['    • Energy Recovered:   ' num2str(total_energy_recovered/3600, '%.4f') ' Wh']
+    ['    • Peak Charging Power:' num2str(min(log.P_batt), '%.1f') ' W']
+    ['    • Peak Charging Curr: ' num2str(min(log.I_batt), '%.1f') ' A']
+    ''
+    ['  OPERATING MODES USED:']
+    ['    • MTPA:               ' num2str(sum(log.mode==1)/N*100, '%.1f') ' % of time']
+    ['    • Field Weakening:    ' num2str(sum(log.mode==2)/N*100, '%.1f') ' % of time']
+    ['    • MPTV:               ' num2str(sum(log.mode==3)/N*100, '%.1f') ' % of time']
+    ''
+    '═══════════════════════════════════════════════════'
+};
+
+axes('Position', [0.05 0.05 0.9 0.9]);
+text(0.05, 0.95, summary_text, 'VerticalAlignment', 'top', ...
+    'FontSize', 11, 'FontName', 'Consolas', 'FontWeight', 'bold');
+axis off;
+
+%% =========================================================================
+%  8. HELPER FUNCTIONS
+%  =========================================================================
+
+function [T_max, Id_opt, Iq_opt] = calculate_mtpa_torque(I_max, Ld, Lq, lambda_pm)
+    % Calculate maximum torque under MTPA with current limit
+    % For IPMSM: T = 1.5*p*(λ_pm*Iq + (Ld-Lq)*Id*Iq)
+    % MTPA condition: Id = -(λ_pm/(2*(Ld-Lq))) - sqrt((λ_pm/(2*(Ld-Lq)))^2 + Iq^2)
+    
+    Iq_range = linspace(0, I_max, 1000);
+    T_range = zeros(size(Iq_range));
+    Id_range = zeros(size(Iq_range));
+    
+    for j = 1:length(Iq_range)
+        Iq_j = Iq_range(j);
+        % MTPA Id for given Iq
+        Id_j = -(lambda_pm/(2*(Ld-Lq))) - sqrt((lambda_pm/(2*(Ld-Lq)))^2 + Iq_j^2);
+        % Check current limit
+        if sqrt(Id_j^2 + Iq_j^2) <= I_max
+            T_range(j) = 1.5 * (lambda_pm * Iq_j + (Ld - Lq) * Id_j * Iq_j);
+            Id_range(j) = Id_j;
+        end
+    end
+    
+    [T_max, idx] = max(T_range);
+    Id_opt = Id_range(idx);
+    Iq_opt = Iq_range(idx);
+end
+
+function [Id_ref, Iq_ref] = calculate_mtpa_currents(T_ref, Ld, Lq, lambda_pm)
+    % Calculate MTPA current references for given torque
+    % For negative torque (regen), Iq is negative
+    
+    p = 1;  % Torque calculation uses 1.5*p, so we work with normalized torque
+    T_norm = T_ref / 1.5;
+    
+    % MTPA trajectory: Id = f(Iq)
+    % Solve: T_norm = λ_pm*Iq + (Ld-Lq)*Id*Iq for Id given T and Iq
+    % Using MTPA condition
+    
+    if abs(T_ref) < 0.01
+        Id_ref = 0;
+        Iq_ref = 0;
+        return;
+    end
+    
+    % Analytical MTPA solution
+    delta_L = Ld - Lq;  % Negative for IPMSM with Lq > Ld
+    
+    % For IPMSM, MTPA gives:
+    % Id = -(λ_pm)/(2*delta_L) - sign(Iq)*sqrt((λ_pm/(2*delta_L))^2 + Iq^2)
+    
+    % Solve iteratively for Iq given T
+    Iq_guess = T_norm / lambda_pm;  % Initial guess (ignoring reluctance)
+    
+    for iter = 1:50
+        Id_guess = -(lambda_pm)/(2*delta_L) - sign(Iq_guess)*sqrt((lambda_pm/(2*delta_L))^2 + Iq_guess^2);
+        T_calc = lambda_pm * Iq_guess + delta_L * Id_guess * Iq_guess;
+        error = T_calc - T_norm;
+        
+        % Numerical derivative
+        dIq = 0.1 * sign(Iq_guess);
+        Id_plus = -(lambda_pm)/(2*delta_L) - sign(Iq_guess+dIq)*sqrt((lambda_pm/(2*delta_L))^2 + (Iq_guess+dIq)^2);
+        T_plus = lambda_pm * (Iq_guess+dIq) + delta_L * Id_plus * (Iq_guess+dIq);
+        dT_dIq = (T_plus - T_calc) / dIq;
+        
+        if abs(dT_dIq) > 1e-10
+            Iq_guess = Iq_guess - error / dT_dIq;
+        else
+            break;
+        end
+        
+        if abs(error) < 1e-6
+            break;
+        end
+    end
+    
+    Id_ref = -(lambda_pm)/(2*delta_L) - sign(Iq_guess)*sqrt((lambda_pm/(2*delta_L))^2 + Iq_guess^2);
+    Iq_ref = Iq_guess;
+end
+
+function [Iq_mtpa] = calculate_mtpa_currents_from_Id(Id, Ld, Lq, lambda_pm)
+    % Calculate Iq on MTPA trajectory for given Id
+    delta_L = Ld - Lq;
+    Iq_sq = Id^2 - lambda_pm * Id / delta_L;
+    if Iq_sq < 0
+        Iq_sq = 0;
+    end
+    Iq_mtpa = sqrt(Iq_sq);
+end
+
+function [Id_ref, Iq_ref] = calculate_fw_currents(T_ref, Vs_max, omega_e, Rs, Ld, Lq, lambda_pm, I_max)
+    % Field Weakening with current limit intersection
+    
+    delta_L = Ld - Lq;
+    T_norm = T_ref / 1.5;
+    
+    % Iterate to find Id, Iq that satisfy both torque and voltage equations
+    Id_guess = 0;
+    Iq_guess = T_norm / lambda_pm;
+    
+    for iter = 1:100
+        % Voltage equations
+        Vd = Rs*Id_guess - omega_e*Lq*Iq_guess;
+        Vq = Rs*Iq_guess + omega_e*Ld*Id_guess + omega_e*lambda_pm;
+        Vs = sqrt(Vd^2 + Vq^2);
+        
+        % Torque
+        T_calc = lambda_pm * Iq_guess + delta_L * Id_guess * Iq_guess;
+        
+        % Errors
+        err_V = Vs - Vs_max;
+        err_T = T_calc - T_norm;
+        
+        % Adjust Id (more negative = more FW)
+        dId = -0.5;
+        Vd_plus = Rs*(Id_guess+dId) - omega_e*Lq*Iq_guess;
+        Vq_plus = Rs*Iq_guess + omega_e*Ld*(Id_guess+dId) + omega_e*lambda_pm;
+        Vs_plus = sqrt(Vd_plus^2 + Vq_plus^2);
+        dVs_dId = (Vs_plus - Vs) / dId;
+        
+        if abs(dVs_dId) > 1e-10
+            Id_guess = Id_guess - err_V / dVs_dId;
+        end
+        
+        % Adjust Iq to maintain torque
+        if abs(delta_L * Id_guess) > 1e-10
+            Iq_guess = T_norm / (lambda_pm + delta_L * Id_guess);
+        else
+            Iq_guess = T_norm / lambda_pm;
+        end
+        
+        % Apply current limit
+        Is = sqrt(Id_guess^2 + Iq_guess^2);
+        if Is > I_max
+            scale = I_max / Is;
+            Id_guess = Id_guess * scale;
+            Iq_guess = Iq_guess * scale;
+        end
+        
+        if abs(err_V) < 0.1 && abs(err_T) < 0.01
+            break;
+        end
+    end
+    
+    Id_ref = Id_guess;
+    Iq_ref = Iq_guess;
+end
+
+function [Id_ref, Iq_ref] = calculate_mptv_currents(T_ref, Vs_max, omega_e, Rs, Ld, Lq, lambda_pm)
+    % Maximum Torque Per Voltage - voltage limited operation
+    
+    delta_L = Ld - Lq;
+    T_norm = T_ref / 1.5;
+    
+    % MPTV occurs at the intersection of constant torque curve and voltage ellipse
+    % with maximum Id (most negative) for that torque
+    
+    % Start from characteristic current
+    Id_char = -lambda_pm / Lq;
+    Id_guess = Id_char;
+    Iq_guess = T_norm / (lambda_pm + delta_L * Id_char);
+    
+    for iter = 1:100
+        % Voltage
+        Vd = Rs*Id_guess - omega_e*Lq*Iq_guess;
+        Vq = Rs*Iq_guess + omega_e*Ld*Id_guess + omega_e*lambda_pm;
+        Vs = sqrt(Vd^2 + Vq^2);
+        
+        % Torque
+        T_calc = lambda_pm * Iq_guess + delta_L * Id_guess * Iq_guess;
+        
+        err_V = Vs - Vs_max;
+        err_T = T_calc - T_norm;
+        
+        % Adjust
+        dId = 0.5;
+        Vd_plus = Rs*(Id_guess+dId) - omega_e*Lq*Iq_guess;
+        Vq_plus = Rs*Iq_guess + omega_e*Ld*(Id_guess+dId) + omega_e*lambda_pm;
+        Vs_plus = sqrt(Vd_plus^2 + Vq_plus^2);
+        dVs_dId = (Vs_plus - Vs) / dId;
+        
+        if abs(dVs_dId) > 1e-10
+            Id_guess = Id_guess - err_V / dVs_dId;
+        end
+        
+        if abs(lambda_pm + delta_L * Id_guess) > 1e-10
+            Iq_guess = T_norm / (lambda_pm + delta_L * Id_guess);
+        end
+        
+        if abs(err_V) < 0.1 && abs(err_T) < 0.01
+            break;
+        end
+    end
+    
+    Id_ref = Id_guess;
+    Iq_ref = Iq_guess;
+end
+
+function [Vd, Vq] = calculate_voltages(Id, Iq, omega_e, Rs, Ld, Lq, lambda_pm)
+    % Calculate steady-state voltages
+    Vd = Rs*Id - omega_e*Lq*Iq;
+    Vq = Rs*Iq + omega_e*Ld*Id + omega_e*lambda_pm;
+end

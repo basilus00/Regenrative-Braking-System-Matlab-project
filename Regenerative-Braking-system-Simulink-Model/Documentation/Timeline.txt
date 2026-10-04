@@ -1,0 +1,85 @@
+4. Project timeline :
+ Week 1: February 1– February 7, 2026
+Objective: Research and Background – Build foundational knowledge on regenerative braking
+systems. Key tasks: Review literature on principles, types (electric, hydraulic), real-world
+applications (EVs, hybrids), vehicle dynamics, energy recovery equations, key parameters, and
+case studies from IEEE papers and journals.
+Main deliverables:
+Project presentation / Fixing timeline
+ Week 2: February 16 – February 22, 2026
+Objective: Define Project Scope and Requirements – Outline what the model will simulate and
+set clear boundaries.
+Key tasks: Define specific goals (e.g., energy recovery in a simple EV under urban cycles),
+select modelling approach, list input/output variables, choose tools (Python or
+MATLAB/Simulink), assess risks.
+Main deliverables:
+
+ Project scope document including objectives, assumptions, and
+limitations
+ List of required data and parameters
+
+1
+
+ Week 3: February 23 – March 1, 2026
+Objective: Data Collection and Tool Setup – Prepare data and modelling environment.
+Key tasks: Collect standard drive-cycle datasets (WLTP, NEDC, etc.), install and learn
+chosen software, prototype basic energy calculations, run initial validation tests.
+Main deliverables:
+
+ Dataset repository (Excel/CSV files)
+ Basic tool setup guide or Jupyter/MATLAB notebook
+
+ Week 4: March 2 – March 8, 2026
+Objective: Model Design – Architect the core structure of the model.
+Key tasks: Design system components (brake controller, motor/generator, battery), create
+energy flow diagrams, define equations for efficiency, friction blending, and constraints
+(e.g., SOC limits).
+Main deliverables:
+
+ Model design diagrams (Draw.io, Simulink sketches, or similar)
+ Preliminary set of equations
+ Week 5: March 9 – March 15, 2026
+Objective: Model Implementation – Build the actual model in software.
+Key tasks: Code or build the model, integrate subsystems, handle edge cases (full battery,
+zero regen), perform initial debugging.
+Main deliverables:
+
+ Working prototype model (Python script/file or Simulink model)
+ Basic test results log
+ Week 6: March 16 – March 22, 2026
+Objective: Simulation and Testing – Run simulations and validate the model.
+Key tasks: Simulate different scenarios (city vs. highway), compare accuracy against
+benchmarks, iterate on errors, conduct sensitivity analysis on parameters.
+Main deliverables:
+
+ Simulation results report with graphs (energy vs. time, etc.)
+ Test case summaries
+ Week 7: March 23 – March 29, 2026
+Objective: Analysis and Optimization – Evaluate performance and improve the model.
+Key tasks: Calculate overall efficiency and savings, optimize parameters (using SciPy or
+similar metrics), compare with non-regenerative braking, address additional limitations if
+time allows.
+Main deliverables:
+
+ Analysis report with key metrics and visualizations
+ Optimized version of the model
+
+1
+
+ Week 8: March 30 – April 5, 2026
+Objective: Validation and Refinements – Ensure reliability and make final improvements.
+Key tasks: Validate against real/external EV data, self-audit or peer review for errors, refine
+model (e.g., add GUI if applicable), prepare presentation materials.
+Main deliverables:
+
+ Validation report
+ Final updated model
+ Week 9: April 6 – April 12, 2026
+Objective: Documentation and Presentation – Wrap up and communicate results.
+Key tasks: Compile full documentation, create slides or demo video, reflect on learnings
+and future extensions, archive all files.
+Main deliverables:
+
+ Complete project report (10–15 pages)
+ Presentation deck or short demo video
+ Lessons learned summary

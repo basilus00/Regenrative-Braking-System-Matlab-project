@@ -1,0 +1,66 @@
+┌──────────────────────────────────────────────────────────┐
+│                  Vehicle Controller (ECU)                │
+│  - Receives pedal, brake, speed signals                  │
+│  - Decides T_request (from section A)                    │
+│  - Runs strategy layer: MTPA/FW (from section B)         │
+│  - Outputs: i_d*, i_q* commands                          │
+└────────────────────────┬─────────────────────────────────┘
+                         │ (serial, CAN, or direct line)
+                         ↓
+┌──────────────────────────────────────────────────────────┐
+│         Motor Controller (inside or outside inverter)    │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ Current PI regulators (dq frame)                   │  │
+│  │  - error_d = i_d* - i_d                            │  │
+│  │  - error_q = i_q* - i_q                            │  │
+│  │  → outputs v_d*, v_q* (voltage commands)           │  │
+│  └────────────────────────────────────────────────────┘  │
+│                         │                                │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ Inverse Park + Clarke                             │  │
+│  │  (v_d*, v_q*) → (v_α, v_β) → (v_a, v_b, v_c)     │  │
+│  │  or duty cycle signals (d_a, d_b, d_c)            │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                           │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ SVPWM (Space Vector PWM)                           │  │
+│  │  converts (d_a, d_b, d_c) → PWM duty cycles       │  │
+│  │  → gate drive signals (at 10-20 kHz switching)    │  │
+│  └────────────────────────────────────────────────────┘  │
+│                         │                                │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ Rotor angle estimation (sensorless BEMF observer) │  │
+│  │  or encoder feedback                               │  │
+│  │  → θ_e estimate → used in Park transform          │  │
+│  └────────────────────────────────────────────────────┘  │
+│                         │                                │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ Clarke + Park transforms (feedback path)          │  │
+│  │  (i_a, i_b) → (i_α, i_β) → (i_d, i_q)            │  │
+│  │  (uses same θ_e)                                  │  │
+│  └────────────────────────────────────────────────────┘  │
+│                         │                                │
+└────────────────────────┬─────────────────────────────────┘
+                         │ (gate drive signals)
+                         ↓
+┌──────────────────────────────────────────────────────────┐
+│                  Power Inverter (3-phase bridge)         │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Gate drivers (translate PWM → 6 IGBT gate sig)  │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         │                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Power stage (6 IGBTs or MOSFETs, 3-phase)       │   │
+│  │  PWM switching at ~10 kHz                        │   │
+│  │  Produces AC currents i_a(t), i_b(t), i_c(t)    │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         │                               │
+└────────────────────────┬─────────────────────────────────┘
+                         │ (3-phase AC currents)
+                         ↓
+                    ┌─────────┐
+                    │  Motor  │
+                    │ (IPMSM) │
+                    └─────────┘

@@ -1,0 +1,34 @@
+┌─────────────────────────────────────────────────────┐
+│  Strategy layer (MTPA / FW / current limit)         │
+│  Input: T_request (from A)                          │
+│  Output: i_d*, i_q* (command)                       │
+└──────────┬──────────────────────────────────────────┘
+           │
+           ↓
+┌─────────────────────────────────────────────────────┐
+│  PI current regulators                              │
+│  error_d = i_d* - i_d   ← compare command vs actual │
+│  error_q = i_q* - i_q                               │
+│  Output: v_d, v_q (voltage commands)                │
+└──────────┬──────────────────────────────────────────┘
+           │
+           ↓
+┌─────────────────────────────────────────────────────┐
+│  Inverter / PWM                                     │
+│  (v_d, v_q) → SVPWM → gate signals                  │
+└──────────┬──────────────────────────────────────────┘
+           │
+           ↓ (actual voltages applied to motor)
+┌─────────────────────────────────────────────────────┐
+│  Motor dynamics (electromagnetic + mechanical)      │
+│  currents change: i_a(t), i_b(t), i_c(t)            │
+└──────────┬──────────────────────────────────────────┘
+           │
+           ↓ (sensed back at ADC)
+┌─────────────────────────────────────────────────────┐
+│  Clarke + Park transform                            │
+│  (i_a, i_b, i_c) → (i_α, i_β) → (i_d, i_q) actual  │
+└──────────┬──────────────────────────────────────────┘
+           │
+           ↓ (feedback)
+           back to PI regulators
